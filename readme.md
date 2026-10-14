@@ -6,7 +6,8 @@ slideshow and GabeCube screen.
 
 **Highlights**
 - Five full-screen Gabe images, randomly cycled without stretching or immediate repeats.
-- GabeCube artwork uses the supplied image, cropped to the panel's native aspect ratio.
+- GabeCube artwork uses the supplied image, cropped to the panel's native aspect ratio;
+  the display refreshes only when switching modes.
 - Statistics mode includes CPU/GPU, storage usage, network throughput, and normalized
   system load.
 - SteamOS configuration app selects the display mode over Bluetooth LE.

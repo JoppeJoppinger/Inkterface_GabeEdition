@@ -103,6 +103,7 @@ class CustomDisp : public ThinkInk_583_Mono_AAAMFGN
 CustomDisp MF_DISPLAY(EPD_DC, EPD_RESET, EPD_CS, -1 /* SRAM_CS */, EPD_BUSY);
 
 static unsigned long DISP_DEBOUNCE = 0;
+static bool MODE_REFRESH_PENDING = false;
 
 struct Point { // {{{
     float x;
@@ -339,8 +340,12 @@ class DisplayModeCallbacks : public NimBLECharacteristicCallbacks
     {
         std::string value = characteristic->getValue();
         if (value.size() == 1 && static_cast<uint8_t>(value[0]) <= 2) {
-            STATE.displayMode = static_cast<uint8_t>(value[0]);
-            DISP_DEBOUNCE = 100;
+            const uint8_t mode = static_cast<uint8_t>(value[0]);
+            if (STATE.displayMode != mode) {
+                STATE.displayMode = mode;
+                MODE_REFRESH_PENDING = true;
+                DISP_DEBOUNCE = 100;
+            }
         } else {
             Debug.println("got invalid display mode");
         }
@@ -351,6 +356,9 @@ class FlushCallbacks : public NimBLECharacteristicCallbacks
 { // {{{
     void onWrite(NimBLECharacteristic *characteristic, NimBLEConnInfo &conn) override
     {
+        if (STATE.displayMode == 2 && !MODE_REFRESH_PENDING) {
+            return;
+        }
         STATE.hostMsg = characteristic->getValue();
         DISP_DEBOUNCE = 100;
     }
@@ -488,7 +496,9 @@ void loop()
             std::stringstream line;
             line << std::fixed << std::setprecision(2) << battv << " V";
             STATE.battLine = line.str();
-            DISP_DEBOUNCE = 10;
+            if (STATE.displayMode != 2) {
+                DISP_DEBOUNCE = 10;
+            }
         }
         BATT_DEBOUNCE = 1000;
     }
@@ -517,6 +527,7 @@ void loop()
         MF_DISPLAY.fillScreen(BG_COLOR);
         drawStatic();
         MF_DISPLAY.updateFrame();
+        MODE_REFRESH_PENDING = false;
         Debug.println("drew to display");
     }
 
