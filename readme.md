@@ -2,7 +2,7 @@
 
 An Inkterface customization for the Steam Machine: live system stats and full-screen
 Gabe artwork on a 648×480 monochrome e-paper display, with an app-selectable portrait
-slideshow and GabeCube screen.
+slideshow, GabeCube screen, and Steam-aware Automatic mode.
 
 **Highlights**
 - Five full-screen Gabe images, randomly cycled without stretching or immediate repeats.
@@ -10,10 +10,19 @@ slideshow and GabeCube screen.
   the display refreshes only when switching modes.
 - Statistics mode includes CPU/GPU, storage usage, network throughput, and normalized
   system load.
+- Automatic mode shows Gabe portraits while Steam is idle, alternates statistics with a
+  Now Playing screen during games, and shows GabeCube when Steam is closed. Now Playing
+  can also be selected directly.
+- Now Playing includes game artwork, title, playtime, and public achievements when
+  available; local Steam artwork is preferred, with an optional online artwork fallback.
+- Now Playing and Automatic game screens require the matching updated Feather V2 firmware.
 - SteamOS configuration app selects the display mode over Bluetooth LE.
 
 This edition builds on Valve's Inkterface project. See the original assembly and setup
 instructions below.
+
+The Linux AppImage bundles the Qt QML imports and GUI platform plugins so both the
+configuration window and the headless background service can run on SteamOS.
 
 
 ## Required Hardware
@@ -117,12 +126,19 @@ basics are:
       `registerCollector()` to have it show up in the list.
       * There are some examples of stateful and idempotent collectors in `SysStats`,
         they get registered in the `PanelState` constructor.
-7. Choose the panel content from the `Display` menu: Statistics, Gabe portrait, or
-   GabeCube. The selection is saved and applied by the background service on its next
-   update; portrait mode randomly cycles through five Gabe images without repeating
-   the last image. Mode changes are sent immediately and trigger a full display refresh.
-   Portraits and GabeCube are cropped to fill the 648x480 panel without stretching.
-   Statistics include disk usage, network throughput, and normalized system load.
+7. Choose the panel content from the `Display` menu: Statistics, Gabe portrait, GabeCube,
+   Automatic, or Now Playing. Automatic uses Steam's process state and game-session log
+   to decide what to show. While a game is active, the panel shows Now Playing first, then
+   alternates with Statistics every 30 seconds after the artwork has finished transferring;
+   otherwise it shows the portrait slideshow while Steam is open and GabeCube when Steam is closed.
+   If the host disconnects over BLE, the firmware switches to GabeCube after 60 seconds
+   and restores the selected mode on reconnect.
+   Now Playing artwork is loaded from Steam's local cache or fetched online; achievement
+   details are optional and may be unavailable for private profiles. Install the matching
+   Feather V2 firmware for artwork mode. The selection is saved and mode changes trigger
+   a full display refresh. Portraits and GabeCube are cropped to
+   fill the 648x480 panel without stretching. Statistics include disk usage, network
+   throughput, and normalized system load.
 8. Exit the configuration app.
     * The service is lightweight and runs in the background, you only need to
       run the config software to select a panel or to change what it displays.

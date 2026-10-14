@@ -70,6 +70,12 @@ if [[ "$DEPLOY" == "1" && "$(uname)" == "Linux" ]]; then
 
     echo "Building appimage..."
     APPIMAGE_EXTRACT_AND_RUN=1 QTDIR=$QT_DIR ./appimagetool-*.AppImage deploy $APP_DIR/usr/share/applications/*.desktop
+    mkdir -p $APP_DIR$QT_DIR
+    cp -r $QT_DIR/qml $APP_DIR$QT_DIR/.
+    cp -a $QT_DIR/plugins/. $APP_DIR$QT_DIR/plugins/
+    cp -a $QT_DIR/lib/libQt6*.so* $APP_DIR$QT_DIR/lib/
+    sed -i '/^HERE=/a QT_ROOT=$(dirname "$(find "${HERE}/opt" -type d -path "*/plugins" -print -quit)")' $APP_DIR/AppRun
+    sed -i '/^QT_ROOT=/a export LD_LIBRARY_PATH="${QT_ROOT}/lib:${LD_LIBRARY_PATH}"\nexport QT_PLUGIN_PATH="${QT_ROOT}/plugins:${HERE}/usr/lib/qt6/plugins"\nexport QT_QPA_PLATFORM_PLUGIN_PATH="${QT_ROOT}/plugins/platforms"\nexport QML2_IMPORT_PATH="${QT_ROOT}/qml"' $APP_DIR/AppRun
     APPIMAGE_EXTRACT_AND_RUN=1 VERSION=$GITREV ./appimagetool-*.AppImage $APP_DIR
 
     # TODO: remove unecessary large files from appdir

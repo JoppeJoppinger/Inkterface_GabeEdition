@@ -96,10 +96,26 @@ Item {
             id: displayModeSelector
 
             Layout.preferredWidth: 300
-            currentIndex: Math.max(0, Math.min(2, Number(settings.value("displayMode") || 0)))
-            model: ["Statistics", "Gabe portrait", "GabeCube"]
+            currentIndex: Math.max(0, Math.min(4, Number(settings.value("displayMode") || 0)))
+            model: ["Statistics", "Gabe portrait", "GabeCube", "Automatic", "Now Playing"]
 
             onActivated: settings.setValue("displayMode", currentIndex)
+        }
+
+        VLabel {
+            visible: displayModeSelector.currentIndex === 3 || displayModeSelector.currentIndex === 4
+            text: {
+                if (displayModeSelector.currentIndex === 4) {
+                    return "Now Playing: " + (panelState.gameName || "last game artwork");
+                }
+                if (!panelState.steamRunning) {
+                    return "Steam off: GabeCube";
+                }
+                if (panelState.gameRunning) {
+                    return "Now Playing, then statistics: " + (panelState.gameName || "Unknown game");
+                }
+                return "Steam idle: Gabe portrait";
+            }
         }
     }
 

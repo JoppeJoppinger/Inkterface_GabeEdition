@@ -16,6 +16,7 @@ set(QT_MODULES
     Bluetooth
     Core
     Gui
+    Network
     Qml
     Quick
     QuickControls2

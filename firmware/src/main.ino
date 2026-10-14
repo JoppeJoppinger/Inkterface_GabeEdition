@@ -25,11 +25,16 @@
     NimBLEUUID { "d6f4c07e-4a21-4c69-bd15-43a38a871904" }
 #define DISPLAY_MODE_UUID                                                                         \
     NimBLEUUID { "d6f4c07e-4a21-4c69-bd15-43a38a871905" }
+#define ARTWORK_UUID                                                                               \
+    NimBLEUUID { "d6f4c07e-4a21-4c69-bd15-43a38a871906" }
 #define FLUSH_UUID                                                                                 \
     NimBLEUUID { "d6f4c07e-4a21-4c69-bd15-43a38a8719FF" }
 
 #define SPARKBOX_HEIGHT 90
 #define SPARKBOX_WIDTH 209
+#define ART_MAX_WIDTH 648
+#define ART_MAX_HEIGHT 480
+#define ART_BUFFER_SIZE ((ART_MAX_WIDTH / 8) * ART_MAX_HEIGHT)
 
 #define INTERFACE_VERSION "IFv01"
 
@@ -104,6 +109,10 @@ CustomDisp MF_DISPLAY(EPD_DC, EPD_RESET, EPD_CS, -1 /* SRAM_CS */, EPD_BUSY);
 
 static unsigned long DISP_DEBOUNCE = 0;
 static bool MODE_REFRESH_PENDING = false;
+static uint8_t *ART_BUFFER = nullptr;
+static size_t ART_BYTES_RECEIVED = 0;
+static unsigned long LAST_HOST_CONNECTED_MS = 0;
+static bool OFFLINE_CUBE_SHOWN = false;
 
 struct Point { // {{{
     float x;
@@ -156,6 +165,9 @@ typedef std::vector<KeyVal> KeyVals;
 struct State { // {{{
     bool connected = false;
     uint8_t displayMode = 0;
+    bool artMode = false;
+    uint16_t artWidth = 0;
+    uint16_t artHeight = 0;
     std::string topLine{"Starting up..."};
     std::string midLine{"No User"};
     std::string botLine{"No Activity"};
@@ -180,6 +192,9 @@ struct State { // {{{
 
         connected = false;
         displayMode = 0;
+        artMode = false;
+        artWidth = 0;
+        artHeight = 0;
         topLine = "Waiting on connection...";
         midLine = BLE_NAME;
         botLine = "";
@@ -222,6 +237,8 @@ class ServerCallbacks : public NimBLEServerCallbacks
         // to a host
         NimBLEDevice::stopAdvertising();
         STATE.connected = true;
+        LAST_HOST_CONNECTED_MS = millis();
+        OFFLINE_CUBE_SHOWN = false;
     }
 
     void onDisconnect(NimBLEServer *server, NimBLEConnInfo &conn, int reason) override
@@ -231,10 +248,8 @@ class ServerCallbacks : public NimBLEServerCallbacks
         // connected count appears to be updated after this callback is
         // triggered, so the count will be at least 1 higher than reality
         if (server->getConnectedCount() <= 1) {
-            if (STATE.connected) {
-                DISP_DEBOUNCE = 100;
-            }
-            STATE.reset();
+            STATE.connected = false;
+            LAST_HOST_CONNECTED_MS = millis();
         }
         NimBLEDevice::startAdvertising();
     }
@@ -344,13 +359,91 @@ class DisplayModeCallbacks : public NimBLECharacteristicCallbacks
             if (STATE.displayMode != mode) {
                 STATE.displayMode = mode;
                 MODE_REFRESH_PENDING = true;
-                DISP_DEBOUNCE = 100;
+                if (!STATE.artMode) {
+                    DISP_DEBOUNCE = 100;
+                }
             }
         } else {
             Debug.println("got invalid display mode");
         }
     }
 } DISPLAY_MODE_CALLBACKS;
+
+class ArtworkCallbacks : public NimBLECharacteristicCallbacks
+{
+    void onWrite(NimBLECharacteristic *characteristic, NimBLEConnInfo &conn) override
+    {
+        const std::string value = characteristic->getValue();
+        if (value.empty()) {
+            return;
+        }
+        const auto *data = reinterpret_cast<const uint8_t *>(value.data());
+        switch (data[0]) {
+        case 0x00: {
+            if (value.size() < 5) {
+                Debug.println("got short artwork begin");
+                return;
+            }
+            const uint16_t width = data[1] | (data[2] << 8);
+            const uint16_t height = data[3] | (data[4] << 8);
+            if (width == 0 || height == 0 || width > ART_MAX_WIDTH ||
+                height > ART_MAX_HEIGHT || (width + 7) / 8 * height > ART_BUFFER_SIZE) {
+                Debug.println("rejected invalid artwork dimensions");
+                return;
+            }
+            if (!ART_BUFFER) {
+                ART_BUFFER = static_cast<uint8_t *>(malloc(ART_BUFFER_SIZE));
+            }
+            if (!ART_BUFFER) {
+                Debug.println("no memory for artwork frame");
+                return;
+            }
+            STATE.artWidth = width;
+            STATE.artHeight = height;
+            ART_BYTES_RECEIVED = 0;
+            memset(ART_BUFFER, 0, ART_BUFFER_SIZE);
+            break;
+        }
+        case 0x01: {
+            if (value.size() < 6 || !ART_BUFFER || !STATE.artWidth || !STATE.artHeight) {
+                Debug.println("got invalid artwork data");
+                return;
+            }
+            const uint32_t offset = data[1] | (data[2] << 8) | (data[3] << 16) |
+                                    (static_cast<uint32_t>(data[4]) << 24);
+            const size_t length = value.size() - 5;
+            const size_t frameSize = (STATE.artWidth + 7) / 8 * STATE.artHeight;
+            if (offset != ART_BYTES_RECEIVED || offset > frameSize ||
+                length > frameSize - offset) {
+                Debug.println("rejected nonsequential or out-of-frame artwork data");
+                return;
+            }
+            memcpy(ART_BUFFER + offset, data + 5, length);
+            ART_BYTES_RECEIVED += length;
+            break;
+        }
+        case 0x02: {
+            const size_t frameSize = (STATE.artWidth + 7) / 8 * STATE.artHeight;
+            if (!STATE.artWidth || !STATE.artHeight || ART_BYTES_RECEIVED < frameSize) {
+                Debug.println("ignored incomplete artwork frame");
+                return;
+            }
+            STATE.artMode = true;
+            DISP_DEBOUNCE = 100;
+            break;
+        }
+        case 0x03:
+            if (STATE.artMode) {
+                STATE.artMode = false;
+                DISP_DEBOUNCE = 100;
+            }
+            break;
+        default:
+            Debug.println("got unknown artwork opcode");
+            break;
+        }
+    }
+} ARTWORK_CALLBACKS;
 
 class FlushCallbacks : public NimBLECharacteristicCallbacks
 { // {{{
@@ -411,6 +504,9 @@ void setup()
     characteristic = service->createCharacteristic(DISPLAY_MODE_UUID, NIMBLE_PROPERTY::WRITE);
     characteristic->setCallbacks(&DISPLAY_MODE_CALLBACKS);
 
+    characteristic = service->createCharacteristic(ARTWORK_UUID, NIMBLE_PROPERTY::WRITE);
+    characteristic->setCallbacks(&ARTWORK_CALLBACKS);
+
     characteristic = service->createCharacteristic(FLUSH_UUID, NIMBLE_PROPERTY::WRITE);
     characteristic->setCallbacks(&FLUSH_CALLBACKS);
 
@@ -420,6 +516,7 @@ void setup()
     pinMode(EPD_EN, OUTPUT);
     digitalWrite(EPD_EN, HIGH);
     STATE.reset();
+    LAST_HOST_CONNECTED_MS = millis();
     MF_DISPLAY.begin(THINKINK_MONO);
     MF_DISPLAY.clearBuffer();
     MF_DISPLAY.fillScreen(BG_COLOR);
@@ -496,7 +593,7 @@ void loop()
             std::stringstream line;
             line << std::fixed << std::setprecision(2) << battv << " V";
             STATE.battLine = line.str();
-            if (STATE.displayMode != 2) {
+            if (STATE.displayMode != 2 && !STATE.artMode) {
                 DISP_DEBOUNCE = 10;
             }
         }
@@ -518,6 +615,16 @@ void loop()
         goto loop_end;
     }
 
+    if (!STATE.connected && !OFFLINE_CUBE_SHOWN &&
+        static_cast<unsigned long>(now - LAST_HOST_CONNECTED_MS) >= 60000) {
+        if (STATE.displayMode != 2 || STATE.artMode) {
+            STATE.displayMode = 2;
+            STATE.artMode = false;
+            DISP_DEBOUNCE = 10;
+        }
+        OFFLINE_CUBE_SHOWN = true;
+    }
+
     if (DISP_DEBOUNCE > 0 && DISP_DEBOUNCE > delta) {
         DISP_DEBOUNCE -= delta;
     } else if (DISP_DEBOUNCE > 0) {
@@ -525,7 +632,11 @@ void loop()
         DISP_DEBOUNCE = 0;
         MF_DISPLAY.clearBuffer();
         MF_DISPLAY.fillScreen(BG_COLOR);
-        drawStatic();
+        if (STATE.artMode && ART_BUFFER) {
+            MF_DISPLAY.drawBitmap(0, 0, ART_BUFFER, STATE.artWidth, STATE.artHeight, FG_COLOR);
+        } else {
+            drawStatic();
+        }
         MF_DISPLAY.updateFrame();
         MODE_REFRESH_PENDING = false;
         Debug.println("drew to display");

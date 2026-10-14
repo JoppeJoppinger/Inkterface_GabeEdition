@@ -12,6 +12,7 @@
 #include <QSettings>
 #include <QTimer>
 
+#include "artwork.hpp"
 #include "steam.hpp"
 #include "sysstats.hpp"
 
@@ -234,12 +235,16 @@ class PanelState : public QObject
     Q_PROPERTY(QString botLine READ botLine NOTIFY dataChanged)
     Q_PROPERTY(QList<PanelField *> fields READ fields NOTIFY fieldsChanged)
     Q_PROPERTY(QList<PanelCollector *> collectors READ collectors NOTIFY collectorsChanged)
+    Q_PROPERTY(bool steamRunning READ steamRunning NOTIFY activityChanged)
+    Q_PROPERTY(bool gameRunning READ gameRunning NOTIFY activityChanged)
+    Q_PROPERTY(QString gameName READ gameName NOTIFY activityChanged)
 
   public:
     explicit PanelState(QObject *parent = nullptr)
         : QObject(parent)
         , m_steam(new steam::Steam(this))
         , m_stats(new SysStats(this))
+        , m_artwork(new Artwork(m_steam, this))
         , m_updateTimer(new QTimer(this))
     {
         // str only collectors
@@ -328,6 +333,11 @@ class PanelState : public QObject
 
         connect(m_steam, &steam::Steam::appStarted, this, &PanelState::onAppStarted);
         connect(m_steam, &steam::Steam::appStopped, this, &PanelState::onAppStopped);
+        connect(m_steam, &steam::Steam::steamRunningChanged, this,
+                &PanelState::onSteamRunningChanged);
+        connect(m_steam, &steam::Steam::achievementsUpdated, this,
+                &PanelState::onAchievementsUpdated);
+        connect(m_artwork, &Artwork::frameReady, this, &PanelState::onArtworkFrameReady);
         m_steam->watchConsoleLog(true);
 
         // TODO: allow configuring different numbers/layouts of fields
@@ -353,6 +363,11 @@ class PanelState : public QObject
     const QString &botLine() const { return m_botLine; }
     const QList<PanelField *> fields() const { return m_fields; }
     const QList<PanelCollector *> collectors() const { return m_collectors; }
+    bool steamRunning() const { return m_steam->isRunning(); }
+    bool gameRunning() const { return !m_steam->runningApp().appid.isEmpty(); }
+    QString gameName() const { return m_steam->runningApp().name; }
+    const QByteArray &nowPlayingFrame() const { return m_nowPlayingFrame; }
+    bool hasNowPlayingFrame() const { return !m_nowPlayingFrame.isEmpty(); }
 
     void registerCollector(const QString &displayName, const QString &panelName,
                            const QString &description, DblGetter getter, Formatter fmt = nullptr)
@@ -377,6 +392,8 @@ class PanelState : public QObject
     void dataChanged();
     void fieldsChanged();
     void collectorsChanged();
+    void activityChanged();
+    void artworkFrameReady(QByteArray bits, quint16 width, quint16 height);
 
   public slots:
     void start() { m_updateTimer->start(); }
@@ -421,15 +438,46 @@ class PanelState : public QObject
     }
 
   private slots:
-    void onAppStarted([[maybe_unused]] steam::App details) { updateState(); }
-    void onAppStopped([[maybe_unused]] steam::App details) { updateState(); }
+    void onAppStarted(steam::App details)
+    {
+        m_steam->fetchAchievements(details.appid);
+        m_artwork->composeForApp(details, m_steam->appPlaytimeMinutes(details.appid),
+                                 m_steam->achievements(details.appid));
+        emit activityChanged();
+        updateState();
+    }
+    void onAppStopped([[maybe_unused]] steam::App details)
+    {
+        emit activityChanged();
+        updateState();
+    }
+    void onSteamRunningChanged([[maybe_unused]] bool running)
+    {
+        emit activityChanged();
+        updateState();
+    }
+    void onAchievementsUpdated(const QString &appid)
+    {
+        const auto &app = m_steam->runningApp();
+        if (!app.appid.isEmpty() && app.appid == appid) {
+            m_artwork->composeForApp(app, m_steam->appPlaytimeMinutes(app.appid),
+                                     m_steam->achievements(app.appid));
+        }
+    }
+    void onArtworkFrameReady(QByteArray bits, quint16 width, quint16 height)
+    {
+        m_nowPlayingFrame = std::move(bits);
+        emit artworkFrameReady(m_nowPlayingFrame, width, height);
+    }
 
   private:
     steam::Steam *m_steam = nullptr;
     SysStats *m_stats = nullptr;
+    Artwork *m_artwork = nullptr;
     QTimer *m_updateTimer = nullptr;
 
     bool m_dirty = false;
+    QByteArray m_nowPlayingFrame;
     QString m_topLine;
     QString m_midLine;
     QString m_botLine;

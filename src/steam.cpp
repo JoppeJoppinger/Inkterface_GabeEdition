@@ -6,6 +6,7 @@
 #include <QJsonObject>
 #include <QNetworkReply>
 #include <QSettings>
+#include <QXmlStreamReader>
 
 using namespace Qt::Literals::StringLiterals;
 
@@ -15,10 +16,15 @@ namespace steam
 Steam::Steam(QObject *parent)
     : QObject(parent)
     , m_netman(new QNetworkAccessManager(this))
+    , m_processTimer(new QTimer(this))
 {
+    m_steamRunning = detectSteamProcess();
+    m_processTimer->setInterval(2000);
+    connect(m_processTimer, &QTimer::timeout, this, &Steam::checkSteamProcess);
+    m_processTimer->start();
 }
 
-QString Steam::steamDir()
+QString Steam::steamDir() const
 {
     QString result;
 #if defined(Q_OS_MACOS)
@@ -35,16 +41,51 @@ QString Steam::steamDir()
 
 QString Steam::currentUser(bool account_name)
 {
-    QString result;
-    QVariantMap loginusers = loadVDF(steamDir() + "/config/loginusers.vdf");
-    const auto users = loginusers.value("users").toMap();
-    for (auto &user : users) {
-        if (user.toMap().value("MostRecent").value<QByteArray>() == "1"_ba) {
-            result = user.toMap().value(account_name ? "AccountName" : "PersonaName").toString();
-            break;
+    const QString id = currentUserId();
+    const QVariantMap loginusers = loadVDF(steamDir() + "/config/loginusers.vdf");
+    const QVariantMap user = vdfGet(loginusers, {u"users"_s, id}).toMap();
+    return vdfGet(user, {account_name ? u"AccountName"_s : u"PersonaName"_s}).toString();
+}
+
+QVariant Steam::vdfGet(const QVariantMap &map, const QStringList &path) const
+{
+    QVariant node = map;
+    for (const auto &key : path) {
+        const QVariantMap values = node.toMap();
+        auto it = values.cbegin();
+        for (; it != values.cend(); ++it) {
+            if (it.key().compare(key, Qt::CaseInsensitive) == 0) {
+                break;
+            }
+        }
+        if (it == values.cend()) {
+            return {};
+        }
+        node = it.value();
+    }
+    return node;
+}
+
+QString Steam::currentUserId()
+{
+    const QVariantMap loginusers = loadVDF(steamDir() + "/config/loginusers.vdf");
+    const QVariantMap users = vdfGet(loginusers, {u"users"_s}).toMap();
+    QString bestId;
+    int bestRank = -1;
+    qint64 bestTimestamp = -1;
+    for (auto it = users.cbegin(); it != users.cend(); ++it) {
+        const QVariantMap user = it.value().toMap();
+        const QString mostRecent = vdfGet(user, {u"MostRecent"_s}).toString();
+        const QString autoLogin = vdfGet(user, {u"AutoLogin"_s}).toString();
+        const int rank = mostRecent == u"1"_s ? 2 : (autoLogin == u"1"_s ? 1 : 0);
+        const qint64 timestamp = vdfGet(user, {u"Timestamp"_s}).toString().toLongLong();
+        if (rank > bestRank || (rank == bestRank && timestamp > bestTimestamp)) {
+            bestRank = rank;
+            bestTimestamp = timestamp;
+            bestId = it.key();
         }
     }
-    return result;
+    return bestId;
 }
 
 QString Steam::steamVersion()
@@ -113,6 +154,135 @@ int Steam::installedAppCount()
         }
     }
     return result;
+}
+
+double Steam::appPlaytimeMinutes(const QString &appid)
+{
+    const QString steam64 = currentUserId();
+    if (steam64.isEmpty() || appid.isEmpty()) {
+        return -1;
+    }
+    const quint32 accountId = static_cast<quint32>(steam64.toULongLong() & 0xFFFFFFFFULL);
+    const QString path = u"%1/userdata/%2/config/localconfig.vdf"_s.arg(
+        steamDir(), QString::number(accountId));
+    const QVariantMap config = loadVDF(path);
+    const QVariant playtime = vdfGet(
+        config, {u"UserLocalConfigStore"_s, u"Software"_s, u"Valve"_s, u"Steam"_s, u"apps"_s,
+                 appid, u"Playtime"_s});
+    return playtime.isValid() ? playtime.toDouble() : -1;
+}
+
+QPair<int, int> Steam::achievements(const QString &appid) const
+{
+    return m_achievementCache.value(appid, {-1, -1});
+}
+
+void Steam::fetchAchievements(const QString &appid)
+{
+    const QString steam64 = currentUserId();
+    if (steam64.isEmpty() || appid.isEmpty()) {
+        return;
+    }
+    auto request = QNetworkRequest(
+        u"https://steamcommunity.com/profiles/%1/stats/%2/achievements/?xml=1"_s.arg(steam64,
+                                                                                     appid));
+    auto *reply = m_netman->get(request);
+    QTimer::singleShot(10000, reply, &QNetworkReply::abort);
+    connect(reply, &QNetworkReply::finished, this,
+            [this, appid]() { achievementsReply(appid); });
+}
+
+void Steam::achievementsReply(QString appid)
+{
+    auto *reply = qobject_cast<QNetworkReply *>(QObject::sender());
+    if (!reply) {
+        return;
+    }
+    reply->deleteLater();
+    if (!reply->isOpen() || reply->error() != QNetworkReply::NoError) {
+        qWarning() << "Getting achievements failed:" << reply->errorString();
+        return;
+    }
+    int unlocked = 0;
+    int total = 0;
+    QXmlStreamReader xml(reply->readAll());
+    while (!xml.atEnd()) {
+        if (xml.readNext() == QXmlStreamReader::StartElement && xml.name() == u"achievement"_s) {
+            ++total;
+            unlocked += xml.attributes().value(u"closed"_s) == u"1"_s ? 1 : 0;
+        }
+    }
+    if (total == 0) {
+        qDebug() << "No public achievements found for" << appid;
+        return;
+    }
+    m_achievementCache[appid] = {unlocked, total};
+    emit achievementsUpdated(appid);
+}
+
+QString Steam::runningAppId()
+{
+    const QString path = QDir::homePath() + u"/.steam/registry.vdf"_s;
+    if (!QFile::exists(path)) {
+        return {};
+    }
+    const QVariantMap registry = loadVDF(path);
+    if (registry.isEmpty()) {
+        return {};
+    }
+    const QVariant value =
+        vdfGet(registry, {u"Registry"_s, u"HKCU"_s, u"Software"_s, u"Valve"_s, u"Steam"_s,
+                          u"RunningAppID"_s});
+    return value.isValid() ? value.toString() : QString{};
+}
+
+bool Steam::detectSteamProcess() const
+{
+#if defined(Q_OS_LINUX)
+    const QDir proc(u"/proc"_s);
+    const auto entries = proc.entryList(QDir::Dirs | QDir::NoDotAndDotDot);
+    for (const auto &entry : entries) {
+        if (entry.isEmpty() || !entry.front().isDigit()) {
+            continue;
+        }
+        QFile comm(proc.absoluteFilePath(entry + u"/comm"_s));
+        if (comm.open(QFile::ReadOnly) && comm.readLine().trimmed() == "steam"_ba) {
+            return true;
+        }
+    }
+    return false;
+#else
+    return QFile::exists(steamDir() + u"/steam.pid"_s);
+#endif
+}
+
+void Steam::checkSteamProcess()
+{
+    const bool running = detectSteamProcess();
+    if (running != m_steamRunning) {
+        m_steamRunning = running;
+        emit steamRunningChanged(running);
+    }
+    if (running) {
+        if (!m_consoleLog || !m_consoleLog->isOpen()) {
+            watchConsoleLog(true);
+        }
+        return;
+    }
+    m_regDisagreeStreak = 0;
+    if (m_consoleTimer) {
+        m_consoleTimer->stop();
+    }
+    if (m_consoleLog && m_consoleLog->isOpen()) {
+        m_consoleLog->close();
+        m_consoleLog->deleteLater();
+        m_consoleLog = nullptr;
+    }
+    if (!m_runningApp.appid.isEmpty()) {
+        const App stopped = m_runningApp;
+        m_runningApp.clear();
+        emit appStopped(stopped);
+    }
 }
 
 QString Steam::appName(const QString &appid)
@@ -234,6 +404,9 @@ QString Steam::parseVDF(const QByteArray &data, QVariantMap &output)
 
 void Steam::watchConsoleLog(bool start)
 {
+    if (start && !m_steamRunning) {
+        return;
+    }
     if (!start && (m_consoleLog == nullptr || !m_consoleLog->isOpen())) {
         if (m_consoleTimer) {
             m_consoleTimer->stop();
@@ -247,8 +420,11 @@ void Steam::watchConsoleLog(bool start)
         m_consoleLog->setFileName(steamDir() + "/logs/console_log.txt");
         if (!m_consoleLog->open(QFile::ReadOnly)) {
             qDebug() << "Failed to open console_log.txt!";
+            m_consoleLog->deleteLater();
+            m_consoleLog = nullptr;
             return;
         }
+        m_consoleLog->seek(m_consoleLog->size());
         if (!m_consoleTimer) {
             m_consoleTimer = new QTimer(this);
             m_consoleTimer->setSingleShot(false);
@@ -286,6 +462,27 @@ void Steam::watchConsoleLog(bool start)
     if (appChanged) {
         getAppDetails(lastAppId, !m_runningApp.appid.isEmpty(),
                       m_runningApp.appid.isEmpty() && !lastAppId.isEmpty());
+    }
+
+    const QString registryApp = runningAppId();
+    if (!registryApp.isNull()) {
+        const QString registryId = registryApp.isEmpty() ? u"0"_s : registryApp;
+        const QString currentId = m_runningApp.appid.isEmpty() ? u"0"_s : m_runningApp.appid;
+        if (registryId == currentId) {
+            m_regDisagreeStreak = 0;
+        } else if (++m_regDisagreeStreak >= 3) {
+            m_regDisagreeStreak = 0;
+            const QString previous = m_runningApp.appid;
+            m_runningApp.clear();
+            if (registryId == u"0"_s) {
+                if (!previous.isEmpty()) {
+                    getAppDetails(previous, false, true);
+                }
+            } else {
+                m_runningApp.appid = registryId;
+                getAppDetails(registryId, true, false);
+            }
+        }
     }
 
     // "[2025-10-06 12:19:18] CAPIJobRequestUserStats - Server response failed 2\r\n"
@@ -364,13 +561,18 @@ void Steam::getAppDetails(QString appid, bool emit_start, bool emit_stop)
         QNetworkRequest(u"https://store.steampowered.com/api/appdetails/?appids=%1"_s.arg(appid));
     auto reply = m_netman->get(req);
     QTimer::singleShot(5000, reply, &QNetworkReply::abort);
-    connect(reply, &QNetworkReply::finished, this,
-            [&, appid, emit_start, emit_stop]() { appDetailsReply(appid, emit_start, emit_stop); });
+    connect(reply, &QNetworkReply::finished, this, [this, appid, emit_start, emit_stop]() {
+        appDetailsReply(appid, emit_start, emit_stop);
+    });
 }
 
 void Steam::appDetailsReply(QString appid, bool emit_start, bool emit_stop)
 {
     QNetworkReply *reply = qobject_cast<QNetworkReply *>(QObject::sender());
+    if (!reply) {
+        return;
+    }
+    reply->deleteLater();
     if (!reply->isOpen() || reply->error() != QNetworkReply::NoError) {
         QString message = reply->errorString();
         qWarning() << "Getting app details failed:" << message;

@@ -2,6 +2,7 @@
 
 #include <QByteArray>
 #include <QCoreApplication>
+#include <QDateTime>
 #include <QDataStream>
 #include <QDebug>
 #include <QObject>
@@ -22,6 +23,8 @@
     QUuid { "d6f4c07e-4a21-4c69-bd15-43a38a871904" }
 #define DISPLAY_MODE_UUID                                                                         \
     QUuid { "d6f4c07e-4a21-4c69-bd15-43a38a871905" }
+#define ARTWORK_UUID                                                                               \
+    QUuid { "d6f4c07e-4a21-4c69-bd15-43a38a871906" }
 #define FLUSH_UUID                                                                                 \
     QUuid { "d6f4c07e-4a21-4c69-bd15-43a38a8719FF" }
 
@@ -58,6 +61,9 @@ Panel::Panel(QObject *parent)
     m_modeTimer->setInterval(500);
     connect(m_modeTimer, &QTimer::timeout, this, &Panel::checkDisplayMode);
     m_modeTimer->start();
+
+    connect(m_state, &PanelState::activityChanged, this, &Panel::checkDisplayMode);
+    connect(m_state, &PanelState::artworkFrameReady, this, &Panel::onArtworkFrameReady);
 }
 
 void Panel::stop()
@@ -124,6 +130,14 @@ void Panel::onServiceStateChanged(QLowEnergyService::ServiceState state)
         return;
     }
     qDebug() << "Found " << m_service->characteristics().count() << "characteristics!";
+    m_artworkSupported = m_service->characteristic(ARTWORK_UUID).isValid();
+    if (!m_artworkSupported) {
+        qWarning() << "Connected panel firmware lacks Now Playing support; update its firmware";
+    }
+    m_lastDisplayMode = -1;
+    m_lastEffectiveMode = -1;
+    sendArtworkClear();
+    checkDisplayMode();
     m_sendTimer->start(250);
     m_lastComms = std::chrono::steady_clock::now();
 }
@@ -140,6 +154,38 @@ void Panel::onServiceCharacteristicWritten(
     [[maybe_unused]] const QByteArray &value)
 {
     m_lastComms = std::chrono::steady_clock::now();
+    if (characteristic.uuid().toString() == ARTWORK_UUID.toString()) {
+        const bool frameCompleted =
+            m_artQueue.size() == 1 && !m_artQueue.first().isEmpty() &&
+            static_cast<uint8_t>(m_artQueue.first().at(0)) == 0x02;
+        if (!m_artQueue.isEmpty()) {
+            m_artQueue.removeFirst();
+        }
+        m_artSending = false;
+        if (!m_artQueue.isEmpty()) {
+            sendArtwork();
+        } else if (m_artClearPending) {
+            sendArtworkClear();
+        } else if (m_artResendPending) {
+            m_artResendPending = false;
+            queueArtworkFrame();
+        } else if (frameCompleted && m_lastDisplayMode == 3 && m_lastEffectiveMode == 3 &&
+                   m_autoShowArtwork) {
+            qDebug() << "Now Playing artwork transfer completed";
+            m_nextAutomaticSwitch = std::chrono::steady_clock::now() + std::chrono::seconds(30);
+        }
+    }
+}
+
+void Panel::onArtworkFrameReady(const QByteArray &bits, quint16 width, quint16 height)
+{
+    m_nowPlayingBits = bits;
+    m_nowPlayingWidth = width;
+    m_nowPlayingHeight = height;
+    const bool transitioned = syncDisplayMode();
+    if (!transitioned && m_lastEffectiveMode == 3) {
+        queueArtworkFrame();
+    }
 }
 
 void Panel::writeLine(const QUuid &uuid, const QString &value)
@@ -171,20 +217,154 @@ bool Panel::syncDisplayMode()
     }
     QSettings settings;
     settings.sync();
-    const auto displayMode = qBound(0, settings.value(u"displayMode"_s, 0).toInt(), 2);
-    if (displayMode == m_lastDisplayMode) {
+    const int displayMode = qBound(0, settings.value(u"displayMode"_s, 0).toInt(), 4);
+    if (displayMode != m_lastDisplayMode) {
+        m_lastDisplayMode = displayMode;
+        m_autoGameActive = false;
+        m_autoShowArtwork = false;
+        m_nextAutomaticSwitch = {};
+    }
+
+    int effectiveMode = displayMode;
+    if (displayMode == 3) {
+        const auto now = std::chrono::steady_clock::now();
+        if (!m_state->steamRunning()) {
+            m_autoGameActive = false;
+            m_autoShowArtwork = false;
+            m_nextAutomaticSwitch = {};
+            effectiveMode = 2;
+        } else if (!m_state->gameRunning()) {
+            m_autoGameActive = false;
+            m_autoShowArtwork = false;
+            m_nextAutomaticSwitch = {};
+            effectiveMode = 1;
+        } else if (!m_artworkSupported) {
+            m_autoGameActive = false;
+            m_autoShowArtwork = false;
+            m_nextAutomaticSwitch = {};
+            effectiveMode = 0;
+        } else {
+            if (!m_autoGameActive) {
+                m_autoGameActive = true;
+                m_autoShowArtwork = true;
+                m_nextAutomaticSwitch = now + std::chrono::seconds(30);
+            } else if (now >= m_nextAutomaticSwitch &&
+                       !(m_autoShowArtwork && m_artSending)) {
+                m_autoShowArtwork = !m_autoShowArtwork;
+                m_nextAutomaticSwitch = now + std::chrono::seconds(30);
+            }
+            effectiveMode = m_autoShowArtwork && m_state->hasNowPlayingFrame() ? 3 : 0;
+        }
+    } else if (displayMode == 4) {
+        effectiveMode = m_artworkSupported ? 3 : 0;
+    }
+
+    if (effectiveMode == m_lastEffectiveMode) {
         return false;
     }
-    writeDisplayMode(static_cast<uint8_t>(displayMode));
-    m_lastDisplayMode = displayMode;
+    const int previousMode = m_lastEffectiveMode;
+    m_lastEffectiveMode = effectiveMode;
+    qDebug() << "Panel display mode changed:" << previousMode << "->" << effectiveMode;
+    if (previousMode == 3 && effectiveMode != 3) {
+        sendArtworkClear();
+    }
+    if (effectiveMode == 3) {
+        queueArtworkFrame();
+    } else {
+        writeDisplayMode(static_cast<uint8_t>(effectiveMode));
+    }
     return true;
 }
 
 void Panel::checkDisplayMode()
 {
-    if (syncDisplayMode()) {
-        flushDisplay();
+    if (syncDisplayMode() && m_lastEffectiveMode == 0) {
+        sendState();
     }
+}
+
+void Panel::queueArtworkFrame()
+{
+    if (m_nowPlayingBits.isEmpty() || m_nowPlayingWidth == 0 || m_nowPlayingHeight == 0) {
+        return;
+    }
+    if (m_artSending) {
+        m_artResendPending = true;
+        return;
+    }
+    if (!m_service || m_service->state() != QLowEnergyService::RemoteServiceDiscovered) {
+        return;
+    }
+    auto characteristic = m_service->characteristic(ARTWORK_UUID);
+    if (!characteristic.isValid()) {
+        qWarning() << "Connected panel does not support Now Playing artwork";
+        return;
+    }
+
+    m_artQueue.clear();
+    QByteArray begin;
+    begin.append(char(0x00));
+    begin.append(char(m_nowPlayingWidth & 0xFF));
+    begin.append(char((m_nowPlayingWidth >> 8) & 0xFF));
+    begin.append(char(m_nowPlayingHeight & 0xFF));
+    begin.append(char((m_nowPlayingHeight >> 8) & 0xFF));
+    m_artQueue.append(begin);
+
+    const qsizetype chunkSize = 244;
+    for (qsizetype offset = 0; offset < m_nowPlayingBits.size(); offset += chunkSize) {
+        QByteArray chunk;
+        chunk.append(char(0x01));
+        chunk.append(char(offset & 0xFF));
+        chunk.append(char((offset >> 8) & 0xFF));
+        chunk.append(char((offset >> 16) & 0xFF));
+        chunk.append(char((offset >> 24) & 0xFF));
+        chunk.append(m_nowPlayingBits.mid(offset, chunkSize));
+        m_artQueue.append(chunk);
+    }
+    m_artQueue.append(QByteArray(1, char(0x02)));
+    qDebug() << "Queued Now Playing artwork in" << m_artQueue.size() << "BLE writes";
+    sendArtwork();
+}
+
+void Panel::sendArtwork()
+{
+    if (m_artQueue.isEmpty()) {
+        m_artSending = false;
+        return;
+    }
+    if (!m_service || m_service->state() != QLowEnergyService::RemoteServiceDiscovered) {
+        m_artQueue.clear();
+        m_artSending = false;
+        return;
+    }
+    const auto characteristic = m_service->characteristic(ARTWORK_UUID);
+    if (!characteristic.isValid()) {
+        m_artQueue.clear();
+        m_artSending = false;
+        return;
+    }
+    m_artSending = true;
+    m_service->writeCharacteristic(characteristic, m_artQueue.first());
+}
+
+void Panel::sendArtworkClear()
+{
+    if (!m_service || m_service->state() != QLowEnergyService::RemoteServiceDiscovered) {
+        return;
+    }
+    if (m_artSending) {
+        m_artQueue.clear();
+        m_artClearPending = true;
+        m_artResendPending = false;
+        return;
+    }
+    const auto characteristic = m_service->characteristic(ARTWORK_UUID);
+    if (!characteristic.isValid()) {
+        return;
+    }
+    m_artClearPending = false;
+    m_artQueue = {QByteArray(1, char(0x03))};
+    sendArtwork();
 }
 
 void Panel::writeKeyVal(const uint8_t &index, const QString &key, const QString &value)
@@ -316,7 +496,13 @@ void Panel::clearConnection()
     }
     m_device = QBluetoothDeviceInfo();
     m_connecting = false;
+    m_artworkSupported = false;
     m_lastDisplayMode = -1;
+    m_lastEffectiveMode = -1;
+    m_artQueue.clear();
+    m_artSending = false;
+    m_artResendPending = false;
+    m_artClearPending = false;
 }
 
 void Panel::sendState()
@@ -327,8 +513,9 @@ void Panel::sendState()
     if (!m_service || m_service->state() != QLowEnergyService::RemoteServiceDiscovered) {
         return;
     }
-    const bool modeChanged = syncDisplayMode();
-    if (!m_state->dirty() && !modeChanged && m_lastDisplayMode != 1) {
+    m_sendTimer->start(SEND_INTERVAL);
+    syncDisplayMode();
+    if (m_lastEffectiveMode == 2 || m_lastEffectiveMode == 3) {
         return;
     }
 
@@ -347,8 +534,8 @@ void Panel::sendState()
             }
         }
     }
-    flushDisplay();
+    if (m_state->dirty() || m_lastEffectiveMode == 1) {
+        flushDisplay();
+    }
 
-    m_sendTimer->setInterval(SEND_INTERVAL);
-    m_sendTimer->start();
 }

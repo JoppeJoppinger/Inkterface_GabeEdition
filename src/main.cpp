@@ -6,6 +6,7 @@
 #include <QDir>
 #include <QFont>
 #include <QFontDatabase>
+#include <QGuiApplication>
 #include <QIcon>
 #include <QLoggingCategory>
 #include <QQmlApplicationEngine>
@@ -94,7 +95,8 @@ int runUi(int argc, char *argv[])
 int runHeadless(int argc, char *argv[])
 {
     qDebug() << "Running headless...";
-    QCoreApplication app(argc, argv);
+    qputenv("QT_QPA_PLATFORM", "offscreen");
+    QGuiApplication app(argc, argv);
     UnSig unsig(&app);
     unsig.catchSignal(SIGINT);
     unsig.catchSignal(SIGTERM);
