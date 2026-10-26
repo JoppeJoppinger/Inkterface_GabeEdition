@@ -1,1 +1,3 @@
 docs/Inkterface[[:space:]]Assembly.mp4 filter=lfs diff=lfs merge=lfs -text
+*.sh text eol=lf
+*.bat text eol=crlf

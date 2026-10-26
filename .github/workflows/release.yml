@@ -1,0 +1,71 @@
+name: Release
+
+on:
+  push:
+    tags: ["v*"]
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+jobs:
+  firmware:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+      - name: Install tools
+        run: pip install platformio "esptool>=5,<6"
+      - name: Build and merge firmware
+        run: |
+          mkdir -p out
+          for env in featherv1 featherv2; do
+            pio run -d firmware -e "$env"
+            python scripts/merge_firmware.py "$env" "out/inkterface-firmware-$env.bin"
+          done
+      - uses: actions/upload-artifact@v4
+        with:
+          name: firmware
+          path: out/*.bin
+
+  appimage:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Build builder image
+        run: docker build -t qt69-builder -f Containerfile .
+      - name: Build AppImage
+        run: |
+          docker run --rm --user root -e HOME=/root -v "$PWD:/workspace" -w /workspace \
+            qt69-builder bash -lc 'git config --global --add safe.directory /workspace && ./scripts/build.sh deploy'
+          cp dist-linux-x86_64/Inkterface.AppImage out-Inkterface.AppImage
+      - uses: actions/upload-artifact@v4
+        with:
+          name: appimage
+          path: out-Inkterface.AppImage
+
+  release:
+    needs: [firmware, appimage]
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/download-artifact@v4
+        with:
+          path: artifacts
+      - name: Collect assets
+        run: |
+          mkdir -p release
+          cp artifacts/firmware/*.bin release/
+          cp artifacts/appimage/out-Inkterface.AppImage release/Inkterface.AppImage
+          cd release && sha256sum * > SHA256SUMS
+      - uses: softprops/action-gh-release@v2
+        if: startsWith(github.ref, 'refs/tags/')
+        with:
+          files: release/*
+          generate_release_notes: true
+      - uses: actions/upload-artifact@v4
+        if: ${{ !startsWith(github.ref, 'refs/tags/') }}
+        with:
+          name: release
+          path: release/*

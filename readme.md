@@ -13,7 +13,8 @@ friendly offline sleep with a wake button.
 - [Features](#features)
 - [Required Hardware](#required-hardware)
 - [Assembly](#assembly)
-- [Installation](#installation)
+- [One-Click Installation](#one-click-installation)
+- [Installation (manual)](#installation-manual)
 - [Usage](#usage)
 - [Power saving and battery](#power-saving-and-battery)
 - [Building from source](#building-from-source)
@@ -128,7 +129,40 @@ as it is easy to strip the plastic away and you may need to re-print parts!_**
 The unit magnets onto the front of the Steam Machine. Flash the firmware next.
 
 
-## Installation
+## One-Click Installation
+
+Installs the firmware (USB) and the host app. Both scripts download prebuilt files from
+the latest [GitHub Release](https://github.com/JoppeJoppinger/Inkterface_GabeEdition/releases),
+verify SHA-256 checksums, auto-detect the Feather (V1/V2) and its serial port, and flash it
+with a bundled-on-demand `esptool`. No Python or PlatformIO is required.
+
+**Windows** (flashes the Feather connected to the PC, installs the app on the Steam Machine
+over SSH): double-click `install.bat`, or in PowerShell:
+```
+.\install.ps1 -SteamHost steammachine -SteamUser deck
+```
+Prerequisite on the Steam Machine: SSH enabled (Desktop Mode: set a password with
+`passwd`, then `sudo systemctl enable --now sshd`). Disable SSH again afterwards if you like.
+
+**Linux / SteamOS** (flashes the Feather connected to this machine, installs the app locally):
+```
+chmod +x install.sh
+./install.sh
+```
+You may need serial permission first: `sudo usermod -aG dialout $USER`, then log in again.
+
+Common options (`-Name` on Windows, `--name` on Linux): `board v1|v2`, `port`, `version`,
+`local DIR` (use files from a folder instead of downloading), `skip-firmware`, `skip-app`,
+`dry-run`. Windows additionally has `-SteamHost`, `-SteamUser`, `-SshKey`.
+
+Releases are built by `.github/workflows/release.yml` when a `v*` tag is pushed. Until a
+release exists, build the files yourself and use `local`. `scripts/merge_firmware.py`
+creates the single flashable image (`inkterface-firmware-featherv2.bin`).
+
+After the installer: enable Bluetooth (do not pair the Inkterface) and run the app once in
+Desktop Mode to select your panel and display mode.
+
+## Installation (manual)
 
 Installation has two parts: flashing the **firmware** onto the Feather (from a PC) and
 installing the **host app** on the Steam Machine (SteamOS).
