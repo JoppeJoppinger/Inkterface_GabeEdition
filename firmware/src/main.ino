@@ -6,6 +6,8 @@
 #include <Adafruit_MAX1704X.h>
 #include <Adafruit_ThinkInk.h>
 #include <NimBLEDevice.h>
+#include <driver/gpio.h>
+#include <driver/rtc_io.h>
 #include <esp_sleep.h>
 
 #include "gabe_portrait.h"
@@ -38,8 +40,20 @@
 
 #define INTERFACE_VERSION "IFv01"
 
-// minimum voltage battery can reach before we go into deep sleep
-#define BATT_MINV 2.9
+#define BATT_MINV 3.3f
+#define BATTERY_MONITOR_PIN 35
+#define SW38_PIN GPIO_NUM_38
+#define NEOPIXEL_POWER_PIN GPIO_NUM_2
+
+static constexpr unsigned long OFFLINE_GRACE_MS = 60000;
+static constexpr unsigned long OFFLINE_WINDOW_MS = 30000;
+RTC_DATA_ATTR static bool OFFLINE_SLEEP_ARMED = false;
+
+#if EPD_EN == 32
+static constexpr bool HAS_BATTERY_ADC = true;
+#else
+static constexpr bool HAS_BATTERY_ADC = false;
+#endif
 
 NimBLEServer *BLE_SERVER = nullptr;
 std::string BLE_NAME = "INKTF";
@@ -89,6 +103,7 @@ class CustomDisp : public ThinkInk_583_Mono_AAAMFGN
 
     void updateFrame()
     {
+        m_sleeping = false;
         Debug.println("full display refresh");
         display(false);
         writeRAMFramebufferToEPD(buffer2, buffer2_size, 0);
@@ -96,7 +111,17 @@ class CustomDisp : public ThinkInk_583_Mono_AAAMFGN
         powerOffKeepingRAM();
     }
 
+    void sleepUntilUpdate()
+    {
+        if (!m_sleeping) {
+            powerDown();
+            m_sleeping = true;
+        }
+    }
+
   private:
+    bool m_sleeping = true;
+
     void powerOffKeepingRAM()
     {
         EPD_command(UC8179_POWEROFF);
@@ -113,6 +138,23 @@ static uint8_t *ART_BUFFER = nullptr;
 static size_t ART_BYTES_RECEIVED = 0;
 static unsigned long LAST_HOST_CONNECTED_MS = 0;
 static bool OFFLINE_CUBE_SHOWN = false;
+static unsigned long OFFLINE_AWAKE_MS = OFFLINE_GRACE_MS;
+
+static const uint8_t DISPLAY_HOLD_PINS[] = {
+    EPD_EN, EPD_RESET, EPD_CS, EPD_DC, SCK, MOSI, static_cast<uint8_t>(NEOPIXEL_POWER_PIN)};
+
+void releaseDisplayHolds()
+{
+    for (auto pin : DISPLAY_HOLD_PINS) {
+        digitalWrite(pin, pin == EPD_EN || pin == EPD_RESET || pin == EPD_CS ? HIGH : LOW);
+        pinMode(pin, OUTPUT);
+        const esp_err_t err = gpio_hold_dis(static_cast<gpio_num_t>(pin));
+        if (err != ESP_OK) {
+            Debug.printf("failed to release display GPIO %u: %s\n", pin, esp_err_to_name(err));
+        }
+    }
+    gpio_deep_sleep_hold_dis();
+}
 
 struct Point { // {{{
     float x;
@@ -239,17 +281,17 @@ class ServerCallbacks : public NimBLEServerCallbacks
         STATE.connected = true;
         LAST_HOST_CONNECTED_MS = millis();
         OFFLINE_CUBE_SHOWN = false;
+        OFFLINE_AWAKE_MS = OFFLINE_GRACE_MS;
     }
 
     void onDisconnect(NimBLEServer *server, NimBLEConnInfo &conn, int reason) override
     {
         Debug.print("got disconnect event, connected count: ");
         Debug.println(server->getConnectedCount());
-        // connected count appears to be updated after this callback is
-        // triggered, so the count will be at least 1 higher than reality
-        if (server->getConnectedCount() <= 1) {
+        if (server->getConnectedCount() == 0) {
             STATE.connected = false;
             LAST_HOST_CONNECTED_MS = millis();
+            OFFLINE_AWAKE_MS = OFFLINE_GRACE_MS;
         }
         NimBLEDevice::startAdvertising();
     }
@@ -457,11 +499,84 @@ class FlushCallbacks : public NimBLECharacteristicCallbacks
     }
 } FLUSH_CALLBACKS; // }}}
 
+void enterOfflineSleep(bool force = false)
+{
+    if (!force && (STATE.connected || BLE_SERVER->getConnectedCount() > 0)) {
+        return;
+    }
+    if (!rtc_gpio_is_valid_gpio(SW38_PIN)) {
+        Debug.println("GPIO38 cannot wake from deep sleep; staying awake");
+        LAST_HOST_CONNECTED_MS = millis();
+        return;
+    }
+    const esp_err_t wakeError = esp_sleep_enable_ext0_wakeup(SW38_PIN, 0);
+    if (wakeError != ESP_OK) {
+        Debug.printf("failed to configure SW38 wakeup: %s; staying awake\n",
+                     esp_err_to_name(wakeError));
+        LAST_HOST_CONNECTED_MS = millis();
+        return;
+    }
+    auto *advertising = NimBLEDevice::getAdvertising();
+    if (advertising && advertising->isAdvertising() && !advertising->stop()) {
+        Debug.println("failed to stop BLE advertising; delaying offline sleep");
+        LAST_HOST_CONNECTED_MS = millis();
+        return;
+    }
+    if (!force && (STATE.connected || BLE_SERVER->getConnectedCount() > 0)) {
+        return;
+    }
+
+    MF_DISPLAY.sleepUntilUpdate();
+    if (!force && (STATE.connected || BLE_SERVER->getConnectedCount() > 0)) {
+        return;
+    }
+    pinMode(static_cast<uint8_t>(NEOPIXEL_POWER_PIN), OUTPUT);
+    digitalWrite(static_cast<uint8_t>(NEOPIXEL_POWER_PIN), LOW);
+    digitalWrite(EPD_DC, LOW);
+    digitalWrite(SCK, LOW);
+    digitalWrite(MOSI, LOW);
+    for (auto pin : DISPLAY_HOLD_PINS) {
+        const esp_err_t err = gpio_hold_en(static_cast<gpio_num_t>(pin));
+        if (err != ESP_OK) {
+            Debug.printf("failed to hold display GPIO %u: %s; restarting\n",
+                         pin, esp_err_to_name(err));
+            ESP.restart();
+        }
+    }
+    if (!NimBLEDevice::deinit()) {
+        Debug.println("failed to shut down BLE for offline sleep; restarting");
+        ESP.restart();
+    }
+    gpio_deep_sleep_hold_en();
+    OFFLINE_SLEEP_ARMED = true;
+    Debug.println("offline deep sleep until SW38 press; BLE window: 30 seconds");
+    Serial.flush();
+    Serial1.flush();
+    esp_deep_sleep_start();
+}
+
 void setup()
 { // {{{
     Serial.begin(115200);
     Serial1.begin(115200);
     // these usb serial and rx/tx interfaces are combined in the Debug instance
+    const bool sw38Wake = esp_sleep_get_wakeup_cause() == ESP_SLEEP_WAKEUP_EXT0;
+    const bool offlineWake = sw38Wake && OFFLINE_SLEEP_ARMED;
+    OFFLINE_SLEEP_ARMED = false;
+    releaseDisplayHolds();
+    if (sw38Wake) {
+        const esp_err_t err = rtc_gpio_deinit(SW38_PIN);
+        if (err != ESP_OK) {
+            Debug.printf("failed to restore SW38 as GPIO: %s\n", esp_err_to_name(err));
+        }
+    }
+    pinMode(static_cast<uint8_t>(NEOPIXEL_POWER_PIN), OUTPUT);
+    digitalWrite(static_cast<uint8_t>(NEOPIXEL_POWER_PIN), HIGH);
+    pinMode(static_cast<uint8_t>(SW38_PIN), INPUT);
+    if (HAS_BATTERY_ADC) {
+        analogReadResolution(12);
+        analogSetPinAttenuation(BATTERY_MONITOR_PIN, ADC_11db);
+    }
 
 #if defined(STARTUP_DELAY_MS)
     delay(STARTUP_DELAY_MS);
@@ -518,11 +633,17 @@ void setup()
     STATE.reset();
     LAST_HOST_CONNECTED_MS = millis();
     MF_DISPLAY.begin(THINKINK_MONO);
-    MF_DISPLAY.clearBuffer();
-    MF_DISPLAY.fillScreen(BG_COLOR);
-    drawStatic();
-    MF_DISPLAY.updateFrame();
-    DISP_DEBOUNCE = 10;
+    if (offlineWake) {
+        STATE.displayMode = 2;
+        OFFLINE_CUBE_SHOWN = true;
+        OFFLINE_AWAKE_MS = OFFLINE_WINDOW_MS;
+        Debug.println("SW38 wake: retaining GabeCube without refresh");
+    } else {
+        MF_DISPLAY.clearBuffer();
+        MF_DISPLAY.fillScreen(BG_COLOR);
+        drawStatic();
+        MF_DISPLAY.updateFrame();
+    }
 
     Debug.println("starting ble advert");
     uint32_t addr = (uint64_t)NimBLEDevice::getAddress() & 0xFFFFFF;
@@ -538,6 +659,9 @@ void setup()
     advert->addServiceUUID(SERVICE_UUID);
     advert->enableScanResponse(false);
     NimBLEDevice::startAdvertising();
+    LAST_HOST_CONNECTED_MS = millis();
+    setCpuFrequencyMhz(80);
+    Debug.printf("CPU frequency set to %u MHz\n", getCpuFrequencyMhz());
 
 } // }}}
 
@@ -545,9 +669,9 @@ void loop()
 { // {{{
     static unsigned long LAST_MS = 0;
     static unsigned long CONN_DEBOUNCE = 5000;
-    static unsigned long BATT_DEBOUNCE = 1000;
-    static float last_battp = 0;
+    static unsigned long BATT_DEBOUNCE = 60000;
     static float last_battv = 0;
+    static bool batterySampled = false;
 
     auto now = millis();
     auto delta = now - LAST_MS;
@@ -565,6 +689,15 @@ void loop()
         //       with advertising stopped, so might as well just check here...
         bool advertising = NimBLEDevice::getAdvertising()->isAdvertising();
         uint8_t connections = BLE_SERVER->getConnectedCount();
+        if (STATE.connected != (connections > 0)) {
+            STATE.connected = connections > 0;
+            LAST_HOST_CONNECTED_MS = now;
+            OFFLINE_AWAKE_MS = OFFLINE_GRACE_MS;
+            if (STATE.connected) {
+                OFFLINE_CUBE_SHOWN = false;
+            }
+            Debug.println("reconciled BLE connection state");
+        }
         if (!advertising && connections == 0) {
             Debug.print("starting advertisement, we have no connections");
             NimBLEDevice::startAdvertising();
@@ -575,21 +708,25 @@ void loop()
         CONN_DEBOUNCE = 5000;
     }
 
-    if (MAXLIPO_PRESENT && BATT_DEBOUNCE > 0 && BATT_DEBOUNCE > delta) {
+    if ((MAXLIPO_PRESENT || HAS_BATTERY_ADC) && batterySampled && BATT_DEBOUNCE > delta) {
         BATT_DEBOUNCE -= delta;
-    } else if (MAXLIPO_PRESENT && BATT_DEBOUNCE > 0) {
-        float battp = maxlipo.cellPercent();
-        float battv = maxlipo.cellVoltage();
-        if (abs(battp - last_battp) > 1 || abs(battv - last_battv) > 0.01) {
-            last_battp = battp;
+    } else if (MAXLIPO_PRESENT || HAS_BATTERY_ADC) {
+        float battv = 0;
+        if (MAXLIPO_PRESENT) {
+            battv = maxlipo.cellVoltage();
+        } else {
+            uint32_t millivolts = 0;
+            for (uint8_t sample = 0; sample < 8; ++sample) {
+                millivolts += analogReadMilliVolts(BATTERY_MONITOR_PIN);
+                delay(2);
+            }
+            battv = (millivolts / 8.0f) * 0.002f;
+        }
+        batterySampled = true;
+        if (abs(battv - last_battv) > 0.02f) {
             last_battv = battv;
-            Debug.print("batt: ");
-            Debug.print(battp, 1);
-            Debug.print("% total, ");
-            Debug.print(maxlipo.chargeRate(), 1);
-            Debug.print("% rate, ");
-            Debug.print(battv, 2);
-            Debug.println(" V");
+            Debug.printf("battery voltage: %.2f V%s\n", battv,
+                         MAXLIPO_PRESENT ? " (MAX17048)" : " (GPIO35)");
             std::stringstream line;
             line << std::fixed << std::setprecision(2) << battv << " V";
             STATE.battLine = line.str();
@@ -597,26 +734,22 @@ void loop()
                 DISP_DEBOUNCE = 10;
             }
         }
-        BATT_DEBOUNCE = 1000;
+        BATT_DEBOUNCE = 60000;
     }
 
-    if (MAXLIPO_PRESENT && last_battv < BATT_MINV) {
+    if ((MAXLIPO_PRESENT || HAS_BATTERY_ADC) && batterySampled && last_battv < BATT_MINV) {
         Debug.println("drawing low battery message");
         DISP_DEBOUNCE = 0;
         MF_DISPLAY.begin(THINKINK_MONO);
         MF_DISPLAY.clearBuffer();
         MF_DISPLAY.fillScreen(BG_COLOR);
         drawLowBatt();
-        MF_DISPLAY.display();
-        MF_DISPLAY.powerDown();
-        Debug.println("going into deep sleep");
-        // esp_sleep_enable_timer_wakeup(10 * 1000000ULL);
-        esp_deep_sleep_start();
-        goto loop_end;
+        MF_DISPLAY.updateFrame();
+        enterOfflineSleep(true);
     }
 
     if (!STATE.connected && !OFFLINE_CUBE_SHOWN &&
-        static_cast<unsigned long>(now - LAST_HOST_CONNECTED_MS) >= 60000) {
+        static_cast<unsigned long>(now - LAST_HOST_CONNECTED_MS) >= OFFLINE_AWAKE_MS) {
         if (STATE.displayMode != 2 || STATE.artMode) {
             STATE.displayMode = 2;
             STATE.artMode = false;
@@ -642,15 +775,12 @@ void loop()
         Debug.println("drew to display");
     }
 
-    // Debug.println("entering light sleep");
-    // esp_sleep_enable_timer_wakeup(10 * 1000ULL);
-    // esp_err_t err = esp_light_sleep_start();
-    // Debug.println("woke from light sleep");
-    // Debug.print("After sleep, err=%s\n", esp_err_to_name(err));
-    // Debug.print("Wake reason=%d\n", esp_sleep_get_wakeup_cause());
-    // delay(1);
+    if (!STATE.connected && OFFLINE_CUBE_SHOWN && DISP_DEBOUNCE == 0 &&
+        STATE.displayMode == 2 && !STATE.artMode &&
+        static_cast<unsigned long>(now - LAST_HOST_CONNECTED_MS) >= OFFLINE_AWAKE_MS) {
+        enterOfflineSleep();
+    }
 
-loop_end:
     LAST_MS = now;
     delay(10);
 } // }}}

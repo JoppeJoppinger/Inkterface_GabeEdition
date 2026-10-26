@@ -91,6 +91,7 @@ class PanelFinder : public QObject
     }
 
   private slots:
+    void onDeviceDiscovered(const QBluetoothDeviceInfo &info);
     void onDiscoveryEnded();
     void onDiscoveryError(QBluetoothDeviceDiscoveryAgent::Error error)
     {

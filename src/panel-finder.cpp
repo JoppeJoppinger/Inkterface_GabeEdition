@@ -15,6 +15,8 @@ PanelFinder::PanelFinder(QObject *parent)
             &PanelFinder::onDiscoveryEnded);
     connect(m_discoveryAgent, &QBluetoothDeviceDiscoveryAgent::errorOccurred, this,
             &PanelFinder::onDiscoveryError);
+    connect(m_discoveryAgent, &QBluetoothDeviceDiscoveryAgent::deviceDiscovered, this,
+            &PanelFinder::onDeviceDiscovered);
 
     updatePlaceholder();
     startDiscovery();
@@ -59,6 +61,26 @@ void PanelFinder::onDiscoveryEnded()
         return a->name() < b->name();
     });
     startDiscovery();
+    emit panelsChanged();
+}
+
+void PanelFinder::onDeviceDiscovered(const QBluetoothDeviceInfo &info)
+{
+    if (!info.isValid() || info.isCached() || !info.name().startsWith(u"INKTF-"_s)) {
+        return;
+    }
+
+    QSettings settings;
+    const auto selectedName = settings.value(u"panelName"_s).toString();
+    if (selectedName.isEmpty() || info.name() != selectedName || m_panelFound) {
+        return;
+    }
+
+    qDebug() << "Selected panel discovered:" << info.name() << ", RSSI:" << info.rssi();
+    m_panels.append(new PanelInfo(info, this));
+    m_panelFound = true;
+    settings.setValue(u"lastRssi"_s, info.rssi());
+    settings.setValue(u"lastIfaceVersion"_s, m_panels.last()->ifaceVersion());
     emit panelsChanged();
 }
 

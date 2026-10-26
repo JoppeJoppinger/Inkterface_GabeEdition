@@ -131,8 +131,15 @@ basics are:
    to decide what to show. While a game is active, the panel shows Now Playing first, then
    alternates with Statistics every 30 seconds after the artwork has finished transferring;
    otherwise it shows the portrait slideshow while Steam is open and GabeCube when Steam is closed.
-   If the host disconnects over BLE, the firmware switches to GabeCube after 60 seconds
-   and restores the selected mode on reconnect.
+   If the host disconnects over BLE, the firmware switches to GabeCube after 60 seconds,
+   then puts the display controller and ESP32 to sleep. Press SW38 on the Feather to wake
+   it; the panel advertises over BLE for 30 seconds and sleeps again if no host connects.
+   While asleep it cannot reconnect automatically. The SteamOS app connects as soon as it
+   discovers the selected panel. On reconnect, the host restores the selected mode.
+   A connected panel stays awake at 80 MHz, even in GabeCube mode.
+   On Feather V2, GPIO2's NeoPixel/I2C power is disabled during deep sleep and battery
+   voltage is sampled through the onboard GPIO35 divider; at 3.3 V the panel displays
+   a low-battery warning and sleeps until SW38 is pressed.
    Now Playing artwork is loaded from Steam's local cache or fetched online; achievement
    details are optional and may be unavailable for private profiles. Install the matching
    Feather V2 firmware for artwork mode. The selection is saved and mode changes trigger
