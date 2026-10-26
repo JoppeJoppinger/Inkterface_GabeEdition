@@ -39,7 +39,7 @@ jobs:
       - name: Build AppImage
         run: |
           docker run --rm --user root -e HOME=/root -v "$PWD:/workspace" -w /workspace \
-            qt69-builder bash -lc 'git config --global --add safe.directory /workspace && ./scripts/build.sh deploy'
+            qt69-builder bash -lc 'git config --global --add safe.directory /workspace && bash scripts/build.sh deploy'
           cp dist-linux-x86_64/Inkterface.AppImage out-Inkterface.AppImage
       - uses: actions/upload-artifact@v4
         with:
